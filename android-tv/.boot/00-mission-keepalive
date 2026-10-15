@@ -1,0 +1,7 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# 00-mission-keepalive — Termux:Boot entry. Runs once at device boot
+# (requires the Termux:Boot app installed alongside Termux).
+# Acquires a wake lock so Android does not suspend the watchers, then
+# starts the scheduler loop in the foreground of this boot session.
+termux-wake-lock
+exec bash "$HOME/mission-keepalive-androidtv/run.sh" >> "$HOME/mission-keepalive-androidtv/logs/boot.log" 2>&1

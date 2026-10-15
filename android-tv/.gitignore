@@ -1,0 +1,12 @@
+# local-only: never committed, never leaves the box
+config.local.json
+state/
+status/
+logs/
+alerts/
+drafts/
+pending-approval/sweepstakes-*.md
+pending-approval/freebie-candidates.md
+pending-approval/referral-placement-*.md
+digests/
+prompts/idea-bank.md
