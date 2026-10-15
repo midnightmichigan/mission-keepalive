@@ -1,0 +1,23 @@
+name: heartbeat
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  beat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write heartbeat
+        run: |
+          mkdir -p status
+          printf '{"alive": true, "at_utc": "%s", "note": "mission-keepalive is running on GitHub Actions, independent of Muse tokens"}\n' "$(date -u +%FT%TZ)" > status/heartbeat.json
+      - name: Commit heartbeat
+        run: |
+          git config user.name "mission-keepalive"
+          git config user.email "mission-keepalive@users.noreply.github.com"
+          git add status/heartbeat.json
+          git diff --cached --quiet || git commit -m "heartbeat: $(date -u +%FT%TZ)"
+          git push
