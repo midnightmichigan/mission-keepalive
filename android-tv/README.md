@@ -20,21 +20,35 @@ Scheduling is done by `run.sh`, a single foreground loop that wakes every
 ## Worker layer — real work, $0 inference
 
 `scripts/worker.py` runs every 2 hours and does actual mission work (see
-`lanes.md` for the OMEGA lane mapping):
+`lanes.md` for the OMEGA lane mapping and the honest ceiling):
 
 | Job | What it makes | Where it lands |
 |---|---|---|
-| draft_outreach (3/run) | outreach email drafts with [PLACEHOLDER] personal details | `drafts/` |
-| gen_prompts | 5 fresh content/idea prompts | `prompts/idea-bank.md` |
+| draft_outreach (3/run) | draft->critic->finalize chain per email, 3 staged files each | `drafts/` |
+| gen_prompts | chained 5-prompt pack (staged + bank) | `prompts/idea-bank.md` |
 | digest | deterministic daily summary | `digests/` |
 | price_watch | price-drop alerts on your watchlist | `alerts/PRICE-*.md` |
 | sweepstakes_prep (1/run) | pre-filled entry packet with requirements analysis | `pending-approval/` |
 | deal_scan (1 source/run) | new freebie candidates from aggregators | `pending-approval/` |
+| delegate | task-request JSONs for the VM's agents | `tasks-out/` -> repo `android-tv-inbox/tasks/` |
 
-Inference: `scripts/inference.py` — primary is the Pollinations keyless lane
-(no signup, no key, verified working Oct 2026), fallback is OpenRouter `:free`
-models (free key in `config.local.json`, no card needed). Calls are spaced
-~16s apart and capped per day (default 40). No PII ever goes into a prompt.
+**Agent orchestration:** `scripts/inference.py` is a 4-provider $0 mesh —
+Pollinations (keyless, primary), Groq (free key, ~30 RPM/~14,400 RPD),
+OpenRouter `:free` (free key, 50/day), Gemini 2.5 Flash via AI Studio (free
+key, ~15 RPM). No credit card for any of them. Every draft runs a
+**role chain**: drafter (Pollinations) -> critic (Groq, enforces the
+personalization standard) -> finalizer (Gemini), each a different
+provider/model with a distinct system prompt. If a provider is down, the
+chain degrades to mesh failover instead of dying. Calls are spaced ~16s
+apart, capped per day (default 40), per-run budget 18. No PII ever goes
+into a prompt.
+
+**Task delegation:** the box can't browse, log in, or send — so
+`job_delegate` writes task-request JSONs (`tasks-out/`) for the VM's real
+agents: `entry_attempt`, `claim_attempt`, `send_review`, `research_deep`,
+`verify`. `scripts/sync.py` pushes them to `android-tv-inbox/tasks/` and
+pulls results from `android-tv-outbox/` into `tasks-in/`. The VM-side cron
+spec is `VM-WATCHER-SPEC.md` (wired separately, every 15 min).
 
 The box never sends, enters, claims, or buys anything — drafts and packets
 wait in `drafts/` and `pending-approval/` for the VM pipelines or Dakota.
@@ -66,14 +80,17 @@ pushes new outputs to `android-tv-inbox/` in the repo for the VM to collect.
 
 ## Honest limits
 
-The watchers watch and flag only. The worker drafts, analyzes, and monitors —
-but the box **never** sends email, enters sweepstakes, creates accounts,
-solves CAPTCHAs, or spends money. Without Muse tokens it **cannot** do AI
-inference beyond the free lanes above, and anything needing accounts, logins,
-or judgment lands in `pending-approval/` for the VM or Dakota. It needs the
-box powered, on Wi-Fi, and Termux kept out of battery optimization. The
-contest queue snapshot goes stale over time — re-running `install-termux.sh`
-refreshes it (idempotent; restarts the loop cleanly).
+The watchers watch and flag only. The worker drafts, critiques, analyzes,
+and monitors — but the box **never** sends email, enters sweepstakes,
+creates accounts, solves CAPTCHAs, spends money, or runs models locally
+(hardware too weak; inference is via the free API mesh). Without Muse
+tokens it **cannot** do anything beyond the free lanes, and anything needing
+accounts, logins, or judgment lands in `pending-approval/` or `tasks-out/`
+for the VM or Dakota. It needs the box powered, on Wi-Fi, and Termux kept
+out of battery optimization. The contest queue snapshot goes stale over
+time — re-running `install-termux.sh` refreshes it (idempotent; restarts
+the loop cleanly). See `lanes.md` "Honest ceiling" for the full CAN/CANNOT
+list with real throughput numbers.
 
 ## Cost
 

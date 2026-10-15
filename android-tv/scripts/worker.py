@@ -4,12 +4,22 @@
 Runs every WORKER_INT (default 2h) from run.sh. Does REAL mission work with
 $0 inference (see inference.py) and deterministic tools:
 
-  1. draft_outreach  — drafts up to 3 outreach emails -> drafts/
-  2. gen_prompts     — new prompt/idea pack -> prompts/idea-bank.md
+  1. draft_outreach  — draft->critic->finalize ROLE CHAIN across three
+                       different providers/models -> drafts/ (3 staged files
+                       per email: -draft, -critique, -final)
+  2. gen_prompts     — same role chain -> prompts/idea-bank.md
   3. digest          — deterministic daily summary -> digests/
   4. price_watch     — price-drop monitoring -> alerts/ on hits
   5. sweepstakes_prep— pre-filled entry packet -> pending-approval/
   6. deal_scan       — one aggregator page per run -> freebie candidates
+  7. delegate        — writes task-request JSON -> tasks-out/ for the VM's
+                       agents (see VM-WATCHER-SPEC.md)
+
+The role chain is genuinely multi-agent: the drafter (Pollinations), the
+critic (Groq, checks the draft against the personalization standard), and
+the finalizer (Gemini) are different providers/models with distinct system
+prompts. If a role's provider is down, the chain degrades gracefully to the
+mesh failover instead of dying.
 
 Hard rules:
 - Nothing is ever SENT, ENTERED, CLAIMED, or BOUGHT from this box. Drafts,
@@ -18,7 +28,7 @@ Hard rules:
 - No PII ever goes into an inference prompt. Drafts use [PLACEHOLDER] tokens;
   the VM fills real details at send time.
 - Inference is capped (daily cap in config.local.json, default 40/day) and
-  spaced (~16s) to respect the free tier.
+  spaced (~16s) to respect the free tier. Per-run call budget: 18.
 - Every job is wrapped: one job failing never stops the others.
 """
 import json
@@ -34,7 +44,113 @@ import inference
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UA = {"User-Agent": "mission-keepalive-androidtv/1.0"}
-MAX_CALLS_PER_RUN = 8
+MAX_CALLS_PER_RUN = 18
+
+_CALL_BUDGET = {"used": 0}
+
+
+def _infer(provider, prompt, system=None, max_tokens=500):
+    """One budgeted inference call. provider=None -> mesh failover."""
+    if _CALL_BUDGET["used"] >= MAX_CALLS_PER_RUN:
+        return None
+    _CALL_BUDGET["used"] += 1
+    if provider:
+        return inference.complete_with(provider, prompt, system, max_tokens)
+    return inference.complete(prompt, system, max_tokens)
+
+
+# ------------------------------------------------------- role chaining
+# Three distinct agents, three different providers. The critic enforces the
+# personalization standard; the finalizer reconciles draft + critique.
+CRITIC_SYSTEM = (
+    "You are a ruthless quality critic for outreach emails. Score the draft "
+    "against these rules and list every violation with a fix: "
+    "(1) Could this email go to ten unrelated companies with only names "
+    "changed? If yes, FAIL. "
+    "(2) Is there a verified, recipient-specific reason for contact? "
+    "(3) Are all personal claims true and supported (no invented usage, no "
+    "invented purchase history)? "
+    "(4) Is the ask appropriate for this organization? "
+    "(5) Any em dash (U+2014) anywhere? FAIL if present. "
+    "(6) Any PR/influencer/collab/partnership/review-program framing? FAIL. "
+    "(7) Any manufactured emotion, begging, or guilt-tripping? FAIL. "
+    "(8) Any real personal details (name, city, email, phone, address)? "
+    "Placeholders only — FAIL on real ones. "
+    "Be specific: quote the offending line, name the rule, give the fix. "
+    "End with one line: VERDICT: PASS or VERDICT: REWRITE."
+)
+
+FINALIZER_SYSTEM = (
+    "You finalize outreach emails. You receive an original draft plus a "
+    "critic's review. Rewrite the email fixing every violation the critic "
+    "found, keeping what was good. Voice: warm, grateful dad, first person. "
+    "No em dashes ever. No PR/influencer/collab framing. Never invent "
+    "personal details — keep [YOUR NAME], [CITY], [EMAIL] placeholders. "
+    "Under 180 words. Output ONLY the final email: 'Subject: ...' line, "
+    "then the body, signed [YOUR NAME]."
+)
+
+PROMPT_CRITIC_SYSTEM = (
+    "You are a ruthless quality critic for content prompts. Reject any "
+    "prompt that is vague, generic, unusable, or duplicated from common "
+    "advice. Each surviving prompt must be concrete and specific enough to "
+    "execute immediately. Quote weak lines and say why they fail. End with "
+    "VERDICT: PASS or VERDICT: REWRITE."
+)
+
+PROMPT_FINALIZER_SYSTEM = (
+    "You finalize a pack of content prompts. You receive a draft pack plus "
+    "a critic's review. Rewrite fixing every weakness, keeping strengths. "
+    "Output ONLY the final numbered list, one prompt per line, each under "
+    "25 words."
+)
+
+
+def role_chain(slug, kind, draft_prompt, draft_system,
+               critic_system, finalizer_system, save_dir, max_tokens=450):
+    """Run draft -> critic -> finalize on three DIFFERENT providers.
+
+    Saves three staged files: <slug>-draft.md, <slug>-critique.md,
+    <slug>-final.md in save_dir. Returns the final text, or the best
+    available stage if the chain degrades. Returns None if nothing works.
+    """
+    roles = inference.ROLE_PROVIDERS
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    os.makedirs(save_dir, exist_ok=True)
+
+    def _save(stage, text):
+        p = os.path.join(save_dir, "%s-%s-%s.md" % (kind, slug, stage))
+        with open(p, "w") as f:
+            f.write("# %s (%s) — %s\n\n%s\n" % (kind, stage, slug, text))
+        return p
+
+    draft = _infer(roles.get("drafter"), draft_prompt, draft_system,
+                   max_tokens)
+    if not draft:
+        log("role_chain %s: drafter failed" % slug)
+        return None
+    _save("draft", draft)
+
+    critic_prompt = ("Critique this %s against your quality rules. Be "
+                     "specific.\n\n%s" % (kind, draft))
+    critique = _infer(roles.get("critic"), critic_prompt, critic_system,
+                      max_tokens)
+    if critique:
+        _save("critique", critique)
+    else:
+        log("role_chain %s: critic failed, finalizing from draft" % slug)
+        critique = "(critic unavailable — finalize from draft alone)"
+
+    final_prompt = ("Original draft:\n%s\n\nCritic's review:\n%s\n\n"
+                    "Now produce the final version." % (draft, critique))
+    final = _infer(roles.get("finalizer"), final_prompt, finalizer_system,
+                   max_tokens)
+    if not final:
+        log("role_chain %s: finalizer failed, using draft" % slug)
+        final = draft
+    _save("final", final)
+    log("role_chain %s: draft->critic->finalize complete" % slug)
+    return final
 
 DRAFT_QUEUE = os.path.join(ROOT, "data", "outreach-draft-queue.md")
 PRICE_LIST = os.path.join(ROOT, "data", "price-watchlist.md")
@@ -142,21 +258,21 @@ def job_draft_outreach():
             "merch/sweepstakes for promo brands, never alcohol product asks). "
             "Subject line first as 'Subject: ...', then the body. Sign as "
             "[YOUR NAME]." % (r["name"], email, category, note))
-        text = inference.complete(prompt, system=DRAFT_SYSTEM, max_tokens=450)
-        if not text:
-            log("draft_outreach: inference unavailable, stopping")
-            break
         slug = _slug(r["name"])
+        final = role_chain(
+            slug, "email", prompt, DRAFT_SYSTEM,
+            CRITIC_SYSTEM, FINALIZER_SYSTEM,
+            os.path.join(ROOT, "drafts"), max_tokens=450)
+        if not final:
+            log("draft_outreach: chain failed for %s, stopping" % r["name"])
+            break
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
-        path = os.path.join(ROOT, "drafts", "email-%s-%s.md" % (slug, stamp))
-        with open(path, "w") as f:
-            f.write("# DRAFT (not sent) — %s\n\nTo: %s\n\n%s\n" % (
-                r["name"], email, text))
         drafted[r["name"]] = stamp
         made += 1
-        log("draft_outreach: drafted %s -> %s" % (r["name"], path))
+        log("draft_outreach: chained %s (draft+critique+final saved)" %
+            r["name"])
     _save_json(os.path.join(ROOT, "state", "drafted.json"), drafted)
-    return "drafted %d" % made
+    return "chained %d" % made
 
 
 # ---------------------------------------------------------------- gen_prompts
@@ -174,21 +290,24 @@ def job_gen_prompts():
         "operation, one per line, numbered. Mix: 2 deal-hunting research "
         "prompts, 1 kids-activity idea prompt, 1 money-saving prompt, "
         "1 seasonal prompt. Each under 25 words.")
-    text = inference.complete(prompt, system=PROMPT_SYSTEM, max_tokens=350)
-    if not text:
-        log("gen_prompts: inference unavailable, skipping")
+    final = role_chain(
+        datetime.now(timezone.utc).strftime("%Y%m%d-%H%M"), "prompts",
+        prompt, PROMPT_SYSTEM, PROMPT_CRITIC_SYSTEM, PROMPT_FINALIZER_SYSTEM,
+        os.path.join(ROOT, "prompts", "staged"), max_tokens=350)
+    if not final:
+        log("gen_prompts: chain failed, skipping")
         return "skipped (no inference)"
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     with open(bank, "a") as f:
-        f.write("\n## %s\n\n%s\n" % (stamp, text))
+        f.write("\n## %s\n\n%s\n" % (stamp, final))
     # cap file size: keep last ~400 lines
     with open(bank) as f:
         lines = f.readlines()
     if len(lines) > 400:
         with open(bank, "w") as f:
             f.writelines(lines[-400:])
-    log("gen_prompts: appended 5 prompts")
-    return "appended 5"
+    log("gen_prompts: chained 5 prompts (staged + bank)")
+    return "chained 5"
 
 
 # ---------------------------------------------------------------- digest
@@ -301,7 +420,7 @@ def job_sweepstakes_prep():
             "(account? CAPTCHA? purchase? age? location limits)? "
             "3. Entry frequency (one-time/daily)? 4. Any red flags?\n\n"
             "Page text:\n%s" % snippet)
-        text = inference.complete(prompt, system=SWEEP_SYSTEM, max_tokens=400)
+        text = _infer(None, prompt, SWEEP_SYSTEM, 400)
         if not text:
             log("sweepstakes_prep: inference unavailable, skipping")
             return "skipped (no inference)"
@@ -371,7 +490,7 @@ def job_deal_scan():
         "name, what is free, and its URL if visible. Format: '- name | what "
         "is free | url'. Skip anything needing purchase.\n\nPage text:\n%s"
         % text)
-    out = inference.complete(prompt, system=DEAL_SYSTEM, max_tokens=600)
+    out = _infer(None, prompt, DEAL_SYSTEM, 600)
     if not out:
         log("deal_scan: inference unavailable, skipping")
         return "skipped (no inference)"
@@ -399,6 +518,117 @@ def job_deal_scan():
     return "no new candidates"
 
 
+# ---------------------------------------------------------------- delegate
+# Task-delegation inbox protocol (see VM-WATCHER-SPEC.md).
+#
+# The box cannot do browser work, logins, CAPTCHAs, or sends. When it builds
+# something the VM's agents should act on, it writes a task-request JSON file
+# to tasks-out/. sync.py pushes tasks-out/ to android-tv-inbox/tasks/ in the
+# repo; the VM watcher (every 15 min) fans each request to subagents/workers
+# and writes results to android-tv-outbox/, which sync.py pulls into tasks-in/.
+#
+# REQUEST schema:
+#   { "id": "task-YYYYMMDD-HHMMSS-<slug>", "created_utc": iso,
+#     "type": "entry_attempt|claim_attempt|send_review|research_deep|verify",
+#     "priority": "high|normal|low", "title": "short human title",
+#     "payload": { ...type-specific... },
+#     "needs": ["browser"|"subagent"|"send-pipeline"|"freebie-pipeline"|...],
+#     "source_file": "pending-approval/...", "status": "queued" }
+#
+# RESULT schema (written by the VM watcher into android-tv-outbox/):
+#   { "id": "<same id>", "completed_utc": iso,
+#     "status": "done|failed|blocked|partial", "summary": "one line",
+#     "result": { ... }, "artifacts": ["repo paths..."] }
+
+DELEGATABLE = {
+    # (source dir prefix, file prefix, request type, needs, priority)
+    "sweepstakes-": ("entry_attempt", ["browser"], "normal"),
+    "freebie-candidates": ("claim_attempt", ["freebie-pipeline"], "normal"),
+}
+
+
+def _task_id(slug):
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return "task-%s-%s" % (stamp, slug[:30])
+
+
+def job_delegate():
+    _ensure("tasks-out", "tasks-in")
+    delegated = _load_json(
+        os.path.join(ROOT, "state", "delegated.json"), {})
+    made = 0
+    pa = os.path.join(ROOT, "pending-approval")
+    if not os.path.isdir(pa):
+        return "no pending-approval dir"
+    for fn in sorted(os.listdir(pa)):
+        if fn.startswith(".") or not fn.endswith(".md"):
+            continue
+        key = "pending-approval/%s" % fn
+        if key in delegated:
+            continue
+        stem = fn[:-3]
+        matched = None
+        for prefix, spec in DELEGATABLE.items():
+            if stem.startswith(prefix):
+                matched = spec
+                break
+        if not matched:
+            continue
+        rtype, needs, priority = matched
+        with open(os.path.join(pa, fn), encoding="utf-8",
+                  errors="replace") as f:
+            body = f.read(4000)
+        # extract URL if present
+        m = re.search(r"https?://[^\s\)\]]+", body)
+        url = m.group(0) if m else ""
+        tid = _task_id(_slug(stem))
+        req = {
+            "id": tid,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "type": rtype,
+            "priority": priority,
+            "title": "Box request: %s" % stem.replace("-", " "),
+            "payload": {"url": url, "packet_preview": body[:1500]},
+            "needs": needs,
+            "source_file": key,
+            "status": "queued",
+        }
+        out = os.path.join(ROOT, "tasks-out", tid + ".json")
+        _save_json(out, req)
+        delegated[key] = tid
+        made += 1
+        log("delegate: queued %s -> %s" % (tid, rtype))
+    # also delegate finalized drafts for VM send-pipeline review (once each)
+    drafts_dir = os.path.join(ROOT, "drafts")
+    if os.path.isdir(drafts_dir):
+        for fn in sorted(os.listdir(drafts_dir)):
+            if not fn.endswith("-final.md"):
+                continue
+            key = "drafts/%s" % fn
+            if key in delegated:
+                continue
+            tid = _task_id(_slug(fn[:-9]))
+            req = {
+                "id": tid,
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "type": "send_review",
+                "priority": "normal",
+                "title": "Review chained draft: %s" % fn,
+                "payload": {"draft_file": key,
+                            "note": "draft->critic->finalize chain output; "
+                                    "run VM send gates before sending"},
+                "needs": ["send-pipeline"],
+                "source_file": key,
+                "status": "queued",
+            }
+            _save_json(os.path.join(ROOT, "tasks-out", tid + ".json"), req)
+            delegated[key] = tid
+            made += 1
+            log("delegate: queued %s -> send_review" % tid)
+    _save_json(os.path.join(ROOT, "state", "delegated.json"), delegated)
+    return "queued %d" % made
+
+
 # ---------------------------------------------------------------- main
 JOBS = [
     ("draft_outreach", job_draft_outreach),
@@ -407,12 +637,13 @@ JOBS = [
     ("price_watch", job_price_watch),
     ("sweepstakes_prep", job_sweepstakes_prep),
     ("deal_scan", job_deal_scan),
+    ("delegate", job_delegate),
 ]
 
 
 def main():
     _ensure("drafts", "prompts", "digests", "pending-approval",
-            "alerts", "state")
+            "alerts", "state", "tasks-out", "tasks-in")
     log("worker run started — %s" % inference.provider_status())
     results = {}
     for name, fn in JOBS:
@@ -421,11 +652,13 @@ def main():
         except Exception as e:
             results[name] = "ERROR: %s: %s" % (type(e).__name__, e)
             log("%s failed: %s" % (name, results[name]))
-    # optional: push new files to the repo for the VM to pick up
+    # optional: push new files to the repo for the VM to pick up,
+    # and pull VM results for delegated tasks
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import sync
-        results["sync"] = sync.push_new_files()
+        results["sync_push"] = sync.push_new_files()
+        results["sync_pull"] = sync.pull_outbox()
     except Exception as e:
         results["sync"] = "skipped: %s" % e
     log("worker run done: %s" % json.dumps(results))

@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""sync.py — push the box's output files to the GitHub repo so the VM can
-pick them up. Stdlib only. COMPLETELY OPTIONAL: runs only if config.local.json
-contains a github_token. The token never leaves the box except in the
-Authorization header to api.github.com.
+"""sync.py — two-way sync between the box and the GitHub repo. Stdlib only.
 
-Pushes new/changed files from drafts/, pending-approval/, digests/, alerts/
-into android-tv-inbox/ on the repo's main branch. Tracks pushed SHAs in
+COMPLETELY OPTIONAL: runs only if config.local.json contains a
+github_token. The token never leaves the box except in the Authorization
+header to api.github.com.
+
+PUSH (box -> repo, android-tv-inbox/): new/changed files from drafts/,
+pending-approval/, digests/, alerts/, and tasks-out/ (task-request JSONs
+for the VM's agents — see VM-WATCHER-SPEC.md). Tracks pushed SHAs in
 state/pushed.json so it never re-pushes unchanged files.
+
+PULL (repo -> box, tasks-in/): result JSONs the VM watcher wrote to
+android-tv-outbox/ are downloaded into tasks-in/ so the box can see what
+its delegated tasks produced. Tracks pulled files in state/pulled.json.
 """
 import base64
 import json
@@ -16,7 +22,9 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.local.json")
 PUSHED_PATH = os.path.join(ROOT, "state", "pushed.json")
-SYNC_DIRS = ("drafts", "pending-approval", "digests", "alerts")
+PULLED_PATH = os.path.join(ROOT, "state", "pulled.json")
+SYNC_DIRS = ("drafts", "pending-approval", "digests", "alerts", "tasks-out")
+OUTBOX_DIR = os.path.join(ROOT, "tasks-in")
 API = "https://api.github.com"
 
 
@@ -99,5 +107,53 @@ def push_new_files():
     return "pushed %d, skipped %d unchanged" % (pushed_count, skipped)
 
 
+def pull_outbox():
+    """Download result JSONs from android-tv-outbox/ in the repo into
+    local tasks-in/. Returns a status string. Read-only except local files."""
+    cfg = _config()
+    token = cfg.get("github_token")
+    repo = cfg.get("github_repo", "midnightmichigan/mission-keepalive")
+    if not token:
+        return "no github_token configured — skipping pull"
+    try:
+        with open(PULLED_PATH) as f:
+            pulled = json.load(f)
+    except Exception:
+        pulled = {}
+    status, listing = _api(
+        "GET", "/repos/%s/contents/android-tv-outbox" % repo, token)
+    if status == 404:
+        return "no outbox in repo yet"
+    if status != 200 or not isinstance(listing, list):
+        return "outbox listing failed (status %s)" % status
+    os.makedirs(OUTBOX_DIR, exist_ok=True)
+    got = 0
+    for entry in listing:
+        name = entry.get("name", "")
+        sha = entry.get("sha", "")
+        if not name.endswith(".json") or pulled.get(name) == sha:
+            continue
+        dl = entry.get("download_url")
+        if not dl:
+            continue
+        req = urllib.request.Request(
+            dl, headers={"User-Agent": "mission-keepalive-androidtv/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            json.loads(body)  # validate before writing
+        except Exception:
+            continue
+        with open(os.path.join(OUTBOX_DIR, name), "w") as f:
+            f.write(body)
+        pulled[name] = sha
+        got += 1
+    os.makedirs(os.path.dirname(PULLED_PATH), exist_ok=True)
+    with open(PULLED_PATH, "w") as f:
+        json.dump(pulled, f, indent=2)
+    return "pulled %d new result(s)" % got
+
+
 if __name__ == "__main__":
     print(push_new_files())
+    print(pull_outbox())
