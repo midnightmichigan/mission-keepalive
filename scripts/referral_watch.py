@@ -5,6 +5,7 @@ Read-only, no logins, no LLM. Writes status/referral-watch.json.
 Alerts (via GitHub issue) only after CONSECUTIVE_MISSES misses in a row,
 to avoid flapping on one transient fetch failure.
 """
+import http.client
 import json
 import os
 import re
@@ -32,6 +33,25 @@ def fetch(url):
     try:
         with urllib.request.urlopen(req, timeout=25) as resp:
             return resp.status, resp.read().decode("utf-8", errors="replace")
+    except http.client.IncompleteRead as e:
+        # Some pools (e.g. museai-code.com) advertise a Content-Length the
+        # connection never fully delivers. The partial bytes are usable.
+        partial = getattr(e, "partial", b"")
+        if partial:
+            return 200, partial.decode("utf-8", errors="replace")
+        return None, f"FETCH_ERROR: IncompleteRead: {e}"
+    except Exception:
+        pass  # fall through to curl fallback
+    # curl fallback: tolerates servers urllib chokes on
+    try:
+        out = subprocess.run(
+            ["curl", "-sL", "--max-time", "25", "-A",
+             "Mozilla/5.0 (X11; Linux x86_64) mission-keepalive/1.0",
+             "-o", "-", "-w", "\n%{http_code}", url],
+            capture_output=True, text=True, timeout=40)
+        body, _, code = out.stdout.rpartition("\n")
+        status = int(code.strip()) if code.strip().isdigit() else None
+        return status, body
     except Exception as e:  # network/DNS/TLS failures
         return None, f"FETCH_ERROR: {type(e).__name__}: {e}"
 
