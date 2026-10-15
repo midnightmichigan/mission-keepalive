@@ -1,0 +1,29 @@
+{
+  "checked_at_utc": "2026-10-15T04:11:27+00:00",
+  "code": "B3NYLG",
+  "pools": {
+    "usemuse.lol": {
+      "url": "https://usemuse.lol/invite-code",
+      "http_status": null,
+      "code_found": false,
+      "consecutive_misses": 2,
+      "note": "fetch_failed",
+      "alert": "failed: To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n"
+    },
+    "museai-code.com": {
+      "url": "https://museai-code.com",
+      "http_status": null,
+      "code_found": false,
+      "consecutive_misses": 2,
+      "note": "fetch_failed",
+      "alert": "failed: To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n"
+    },
+    "landing-page": {
+      "url": "https://midnightmichigan.github.io/muse-invite-code/",
+      "http_status": null,
+      "code_found": false,
+      "consecutive_misses": 1,
+      "note": "fetch_failed"
+    }
+  }
+}
